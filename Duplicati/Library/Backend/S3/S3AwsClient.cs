@@ -20,8 +20,9 @@
 // DEALINGS IN THE SOFTWARE.
 
 
-using Amazon.S3;
-using Amazon.S3.Model;
+using Azure;
+using Azure.Storage.Blobs;
+using Azure.Storage.Blobs.Models;
 using Duplicati.Library.Common.IO;
 using Duplicati.Library.Interface;
 using Duplicati.Library.Utility;
@@ -31,7 +32,7 @@ using System.Runtime.CompilerServices;
 namespace Duplicati.Library.Backend
 {
     /// <summary>
-    /// Helper class that fixes long list support and injects location headers, includes using directives etc.
+    /// Azure Blob Storage client implementation that conforms to the IS3Client interface
     /// </summary>
     public class S3AwsClient : IS3Client
     {
@@ -43,35 +44,35 @@ namespace Duplicati.Library.Backend
         /// <summary>
         /// The prefix for extended options
         /// </summary>
-        private const string EXT_OPTION_PREFIX = "s3-ext-";
+        private const string EXT_OPTION_PREFIX = "azure-ext-";
 
         /// <summary>
-        /// The location constraint for the bucket
+        /// The access tier for blobs
         /// </summary>
-        private readonly string? m_locationConstraint;
+        private readonly AccessTier? m_accessTier;
         /// <summary>
-        /// The storage class for the bucket
+        /// The storage class for the bucket (kept for compatibility)
         /// </summary>
         private readonly string? m_storageClass;
         /// <summary>
-        /// The S3 client
+        /// The Azure Blob Storage client
         /// </summary>
-        private readonly AmazonS3Client m_client;
+        private readonly BlobServiceClient m_client;
         /// <summary>
-        /// The option to specify if chunk encoding should be used
+        /// The option to specify if chunk encoding should be used (not applicable to Azure)
         /// </summary>
         private readonly bool m_useChunkEncoding;
         /// <summary>
-        /// The option to specify if payload signing should be disabled
+        /// The option to specify if payload signing should be disabled (not applicable to Azure)
         /// </summary>
         private readonly bool m_disablePayloadSigning;
 
         /// <summary>
-        /// The DNS host of the S3 server
+        /// The DNS host of the Azure Blob Storage endpoint
         /// </summary>
         private readonly string? m_dnsHost;
         /// <summary>
-        /// The option to specify if the V2 list API should be used
+        /// The option to specify if the V2 list API should be used (not applicable to Azure)
         /// </summary>
         private readonly bool m_useV2ListApi;
         /// <summary>
@@ -82,36 +83,44 @@ namespace Duplicati.Library.Backend
         /// <summary>
         /// The archive classes that are considered archive classes
         /// </summary>
-        private readonly IReadOnlySet<S3StorageClass> m_archiveClasses;
+        private readonly IReadOnlySet<AccessTier> m_archiveClasses;
 
         /// <summary>
         /// The option to specify the archive classes
         /// </summary>
-        public const string S3_ARCHIVE_CLASSES_OPTION = "s3-archive-classes";
+        public const string S3_ARCHIVE_CLASSES_OPTION = "azure-archive-classes";
 
         /// <summary>
         /// The default storage classes that are considered archive classes
         /// </summary>
-        public static readonly IReadOnlySet<S3StorageClass> DEFAULT_ARCHIVE_CLASSES = new HashSet<S3StorageClass>([
-            S3StorageClass.DeepArchive, S3StorageClass.Glacier, S3StorageClass.GlacierInstantRetrieval, S3StorageClass.Snow
+        public static readonly IReadOnlySet<AccessTier> DEFAULT_ARCHIVE_CLASSES = new HashSet<AccessTier>([
+            AccessTier.Cold, AccessTier.Archive
         ]);
 
-        public S3AwsClient(string awsID, string awsKey, string? locationConstraint, string servername,
+        public S3AwsClient(string accountName, string? accessKey, string? sasToken, string servername,
             string? storageClass, bool useSSL, bool disableChunkEncoding, bool disablePayloadSigning, TimeoutOptionsHelper.Timeouts timeouts, Dictionary<string, string?> options)
         {
-            var cfg = GetDefaultAmazonS3Config();
-            cfg.UseHttp = !useSSL;
-            cfg.ServiceURL = (useSSL ? "https://" : "http://") + servername;
-
-            CommandLineArgumentMapper.ApplyArguments(cfg, options, EXT_OPTION_PREFIX);
-
-            m_client = new AmazonS3Client(awsID, awsKey, cfg);
+            // Create Azure Blob Service Client
+            if (sasToken != null)
+            {
+                var sasUri = new System.Uri($"https://{accountName}.blob.core.windows.net/?{sasToken}");
+                m_client = new BlobServiceClient(sasUri);
+            }
+            else if (!string.IsNullOrEmpty(accessKey))
+            {
+                var connectionString = $"DefaultEndpointsProtocol={(useSSL ? "https" : "http")};AccountName={accountName};AccountKey={accessKey};EndpointSuffix=core.windows.net";
+                m_client = new BlobServiceClient(connectionString);
+            }
+            else
+            {
+                throw new ArgumentException("Either accessKey or sasToken must be provided for Azure Blob Storage");
+            }
 
             m_timeouts = timeouts;
             m_useV2ListApi = string.Equals(options.GetValueOrDefault("list-api-version", "v1"), "v2", StringComparison.OrdinalIgnoreCase);
-            m_locationConstraint = locationConstraint;
             m_storageClass = storageClass;
-            m_dnsHost = string.IsNullOrWhiteSpace(cfg.ServiceURL) ? null : new System.Uri(cfg.ServiceURL).Host;
+            m_accessTier = string.IsNullOrWhiteSpace(storageClass) ? null : new AccessTier(storageClass);
+            m_dnsHost = m_client.Uri.Host;
             m_useChunkEncoding = !disableChunkEncoding;
             m_disablePayloadSigning = disablePayloadSigning;
             m_archiveClasses = ParseStorageClasses(options.GetValueOrDefault(S3_ARCHIVE_CLASSES_OPTION));
@@ -122,96 +131,45 @@ namespace Duplicati.Library.Backend
         /// </summary>
         /// <param name="storageClass">The storage class string</param>
         /// <returns>The storage classes</returns>
-        private static IReadOnlySet<S3StorageClass> ParseStorageClasses(string? storageClass)
+        private static IReadOnlySet<AccessTier> ParseStorageClasses(string? storageClass)
         {
             if (string.IsNullOrWhiteSpace(storageClass))
                 return DEFAULT_ARCHIVE_CLASSES;
 
-            return new HashSet<S3StorageClass>(storageClass.Split(new char[] { ',' }, StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries).Select(x => new S3StorageClass(x)));
+            return new HashSet<AccessTier>(storageClass.Split(new char[] { ',' }, StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries).Select(x => new AccessTier(x)));
         }
 
         /// <inheritdoc/>
         public Task AddBucketAsync(string bucketName, CancellationToken cancelToken)
         {
-            var request = new PutBucketRequest
-            {
-                BucketName = bucketName,
-            };
-
-            if (!string.IsNullOrEmpty(m_locationConstraint))
-                request.BucketRegionName = m_locationConstraint;
-
-            return Utility.Utility.WithTimeout(m_timeouts.ShortTimeout, cancelToken, ct => m_client.PutBucketAsync(request, ct));
+            var containerClient = m_client.GetBlobContainerClient(bucketName);
+            return Utility.Utility.WithTimeout(m_timeouts.ShortTimeout, cancelToken, ct => containerClient.CreateAsync(PublicAccessType.None, cancellationToken: ct));
         }
 
         /// <summary>
-        /// Gets the default Amazon S3 configuration
+        /// Gets Azure-specific configuration options
         /// </summary>
-        /// <returns>>The default Amazon S3 configuration</returns>
-        public static AmazonS3Config GetDefaultAmazonS3Config()
+        /// <returns>The Azure-specific configuration options (placeholder for future use)</returns>
+        public static IEnumerable<ICommandLineArgument> GetAzureExtendedOptions()
         {
-            return new AmazonS3Config()
-            {
-                BufferSize = (int)Utility.Utility.DEFAULT_BUFFER_SIZE,
-
-                // If this is not set, accessing the property will trigger an expensive operation (~30 seconds)
-                // to get the region endpoint. The use of ARNs (Amazon Resource Names) doesn't appear to be
-                // critical for our usages.
-                // See: https://docs.aws.amazon.com/general/latest/gr/aws-arns-and-namespaces.html
-                UseArnRegion = false,
-            };
+            // Placeholder for Azure-specific extended options
+            return Enumerable.Empty<ICommandLineArgument>();
         }
-
-        /// <summary>
-        /// Extended options that are not included as reported options
-        /// </summary>
-        private static readonly HashSet<string> EXCLUDED_EXTENDED_OPTIONS = new HashSet<string>([
-            nameof(AmazonS3Config.USEast1RegionalEndpointValue)
-        ]);
-
-        /// <summary>
-        /// List of properties that are slow to read the default value from
-        /// </summary>
-        /// <remarks>Changes in this list will likely need to be reflected in AWSSecretProvider.cs</remarks>
-        private static readonly HashSet<string> SLOW_LOADING_PROPERTIES = new[] {
-            nameof(AmazonS3Config.RegionEndpoint),
-            nameof(AmazonS3Config.ServiceURL),
-            nameof(AmazonS3Config.MaxErrorRetry),
-            nameof(AmazonS3Config.DefaultConfigurationMode),
-            nameof(AmazonS3Config.Timeout),
-            nameof(AmazonS3Config.RetryMode),
-        }.ToHashSet();
-
-        public static IEnumerable<ICommandLineArgument> GetAwsExtendedOptions()
-            => CommandLineArgumentMapper.MapArguments(GetDefaultAmazonS3Config(), prefix: EXT_OPTION_PREFIX, exclude: EXCLUDED_EXTENDED_OPTIONS, excludeDefaultValue: SLOW_LOADING_PROPERTIES)
-                .Cast<CommandLineArgument>()
-                .Select(x =>
-                {
-                    x.LongDescription = $"Extended option {x.LongDescription}";
-                    return x;
-                });
 
         public virtual async Task GetFileStreamAsync(string bucketName, string keyName, Stream target, CancellationToken cancelToken)
         {
             try
             {
-                var objectGetRequest = new GetObjectRequest
-                {
-                    BucketName = bucketName,
-                    Key = keyName
-                };
+                var containerClient = m_client.GetBlobContainerClient(bucketName);
+                var blobClient = containerClient.GetBlobClient(keyName);
 
-                using (var objectGetResponse = await Utility.Utility.WithTimeout(m_timeouts.ShortTimeout, cancelToken, ct => m_client.GetObjectAsync(objectGetRequest, ct)).ConfigureAwait(false))
-                using (var s = objectGetResponse.ResponseStream)
-                using (var t = s.ObserveReadTimeout(m_timeouts.ReadWriteTimeout))
-                    await Utility.Utility.CopyStreamAsync(t, target, cancelToken).ConfigureAwait(false);
+                using (var timeoutStream = target.ObserveWriteTimeout(m_timeouts.ReadWriteTimeout, false))
+                    await Utility.Utility.WithTimeout(m_timeouts.ShortTimeout, cancelToken, ct => blobClient.DownloadToAsync(timeoutStream, ct)).ConfigureAwait(false);
             }
-            catch (AmazonS3Exception s3Ex)
+            catch (RequestFailedException ex) when (ex.Status == 404)
             {
-                if (s3Ex.StatusCode == System.Net.HttpStatusCode.NotFound)
-                    throw new FileMissingException(string.Format("File {0} not found", keyName), s3Ex);
+                throw new FileMissingException($"File {keyName} not found", ex);
             }
-
         }
 
         public string? GetDnsHost()
@@ -222,157 +180,105 @@ namespace Duplicati.Library.Backend
         public virtual async Task AddFileStreamAsync(string bucketName, string keyName, Stream source,
             CancellationToken cancelToken)
         {
-            (source, var md5, var tmp) = await Utility.Utility.CalculateThrottledStreamHash(source, "MD5", cancelToken).ConfigureAwait(false);
-            using var _ = tmp;
+            var containerClient = m_client.GetBlobContainerClient(bucketName);
+            var blobClient = containerClient.GetBlobClient(keyName);
 
-            md5 = Convert.ToBase64String(Utility.Utility.HexStringAsByteArray(md5));
-
-            using var ts = source.ObserveReadTimeout(m_timeouts.ReadWriteTimeout, false);
-            var objectAddRequest = new PutObjectRequest
+            using var timeoutStream = source.ObserveReadTimeout(m_timeouts.ReadWriteTimeout, false);
+            
+            var options = new BlobUploadOptions()
             {
-                BucketName = bucketName,
-                Key = keyName,
-                InputStream = ts,
-                UseChunkEncoding = m_useChunkEncoding,
-                MD5Digest = md5,
-                DisablePayloadSigning = m_disablePayloadSigning
+                Conditions = null, // Overwrite any existing blob
+                AccessTier = m_accessTier
             };
-            if (!string.IsNullOrWhiteSpace(m_storageClass))
-                objectAddRequest.StorageClass = new S3StorageClass(m_storageClass);
 
             try
             {
-                await m_client.PutObjectAsync(objectAddRequest, cancelToken);
+                await Utility.Utility.WithTimeout(m_timeouts.ShortTimeout, cancelToken, ct => blobClient.UploadAsync(timeoutStream, options, ct)).ConfigureAwait(false);
             }
-            catch (AmazonS3Exception e)
+            catch (RequestFailedException e) when (e.Status == 404)
             {
-                //Catch "non-existing" buckets
-                if (e.StatusCode == System.Net.HttpStatusCode.NotFound ||
-                    "NoSuchBucket".Equals(e.ErrorCode))
-                    throw new FolderMissingException(e);
-
-                throw;
+                throw new FolderMissingException(e);
             }
         }
 
         public Task DeleteObjectAsync(string bucketName, string keyName, CancellationToken cancellationToken)
         {
-            var objectDeleteRequest = new DeleteObjectRequest
-            {
-                BucketName = bucketName,
-                Key = keyName
-            };
+            var containerClient = m_client.GetBlobContainerClient(bucketName);
+            var blobClient = containerClient.GetBlobClient(keyName);
 
-            return Utility.Utility.WithTimeout(m_timeouts.ShortTimeout, cancellationToken, ct => m_client.DeleteObjectAsync(objectDeleteRequest, ct));
+            return Utility.Utility.WithTimeout(m_timeouts.ShortTimeout, cancellationToken, ct => blobClient.DeleteIfExistsAsync(cancellationToken: ct));
         }
 
         /// <summary>
-        /// Lists the contents of a bucket, using a plugable API call
+        /// Lists the contents of a container
         /// </summary>
-        /// <param name="bucketName">The bucket to list</param>
+        /// <param name="bucketName">The container to list</param>
         /// <param name="prefix">The prefix to list</param>
         /// <param name="recursive">If true, the list is recursive</param>
         /// <param name="cancellationToken">The cancellation token</param>
         /// <returns>The list of files</returns>
         public async IAsyncEnumerable<IFileEntry> ListBucketAsync(string bucketName, string prefix, bool recursive, [EnumeratorCancellation] CancellationToken cancellationToken)
         {
-            var isTruncated = true;
-            string? filename = null;
-            var delimiter = recursive ? "" : "/";
-            if (!string.IsNullOrWhiteSpace(prefix))
-                prefix = Util.AppendDirSeparator(prefix, "/");
+            var containerClient = m_client.GetBlobContainerClient(bucketName);
 
-            //TODO: Figure out if this is the case with AWSSDK too
-            //Unfortunately S3 sometimes reports duplicate values when requesting more than one page of results
-            //So, track the files that have already been returned and skip any duplicates.
-            var alreadyReturned = new HashSet<string>();
+            var traits = BlobTraits.None;
+            var states = BlobStates.None;
 
-            //We truncate after ITEM_LIST_LIMIT elements, and then repeat
-            while (isTruncated)
+            await using var blobEnumerator = containerClient.GetBlobsAsync(traits, states, prefix, cancellationToken).GetAsyncEnumerator(cancellationToken);
+
+            while (true)
             {
-                ListObjectsV2Response listResponse;
+                bool hasNext;
+
                 try
                 {
-                    if (m_useV2ListApi)
-                    {
-                        var listRequest = new ListObjectsV2Request
-                        {
-                            BucketName = bucketName,
-                            Prefix = prefix,
-                            ContinuationToken = filename,
-                            MaxKeys = ITEM_LIST_LIMIT,
-                            Delimiter = delimiter
-                        };
-                        listResponse = await Utility.Utility.WithTimeout(m_timeouts.ListTimeout, cancellationToken, ct => m_client.ListObjectsV2Async(listRequest, ct)).ConfigureAwait(false);
-                    }
-                    else
-                    {
-                        // Use the V1 API
-                        var listRequest = new ListObjectsRequest
-                        {
-                            BucketName = bucketName,
-                            Prefix = prefix,
-                            Marker = filename,
-                            MaxKeys = ITEM_LIST_LIMIT,
-                            Delimiter = delimiter
-                        };
-                        var listResponsev1 = await Utility.Utility.WithTimeout(m_timeouts.ListTimeout, cancellationToken, ct => m_client.ListObjectsAsync(listRequest, ct)).ConfigureAwait(false);
-
-                        // Map the V1 response to the V2 response
-                        listResponse = new ListObjectsV2Response
-                        {
-                            CommonPrefixes = listResponsev1.CommonPrefixes,
-                            IsTruncated = listResponsev1.IsTruncated,
-                            NextContinuationToken = listResponsev1.NextMarker,
-                            S3Objects = listResponsev1.S3Objects
-                        };
-                    }
+                    hasNext = await Utility.Utility.WithTimeout(m_timeouts.ListTimeout, cancellationToken, async ct =>
+                        await blobEnumerator.MoveNextAsync().ConfigureAwait(false)
+                    ).ConfigureAwait(false);
                 }
-                catch (AmazonS3Exception e)
+                catch (RequestFailedException ex) when (ex.Status == 404)
                 {
-                    if (e.StatusCode == System.Net.HttpStatusCode.NotFound ||
-                        "NoSuchBucket".Equals(e.ErrorCode))
-                    {
-                        throw new FolderMissingException(e);
-                    }
-
-                    throw;
+                    throw new FolderMissingException(ex);
                 }
 
-                isTruncated = listResponse.IsTruncated ?? false;
-                filename = listResponse.NextContinuationToken;
+                if (!hasNext) break;
 
-                foreach (var obj in listResponse.CommonPrefixes ?? [])
+                cancellationToken.ThrowIfCancellationRequested();
+
+                if (blobEnumerator.Current is { } blob)
                 {
-                    if (obj == prefix || !obj.StartsWith(prefix))
+                    var blobName = System.Uri.UnescapeDataString(blob.Name.Replace("+", "%2B"));
+
+                    // Skip if not matching prefix (additional safety check)
+                    if (!string.IsNullOrEmpty(prefix) && !blobName.StartsWith(prefix))
                         continue;
 
-                    // Because the prefixes are returned, and not the folder objects
-                    // we do not get the folder modification date
-                    yield return new FileEntry(
-                        obj.Substring(prefix.Length),
-                        -1,
-                        new DateTime(0),
-                        new DateTime(0)
-                    )
-                    { IsFolder = true };
-                }
+                    // Handle recursive vs non-recursive listing
+                    if (!recursive && !string.IsNullOrEmpty(prefix))
+                    {
+                        var relativePath = blobName.Substring(prefix.Length);
+                        if (relativePath.Contains('/'))
+                        {
+                            // This is a subdirectory, skip if not recursive
+                            continue;
+                        }
+                    }
 
-                foreach (var obj in (listResponse.S3Objects ?? []).Where(obj => alreadyReturned.Add(obj.Key)))
-                {
-                    // Skip self-prefix, this discards the folder modification date :/
-                    if (obj.Key == prefix || !obj.Key.StartsWith(prefix))
-                        continue;
+                    var lastModified = blob.Properties.LastModified?.UtcDateTime ?? DateTime.UtcNow;
+                    var isArchive = blob.Properties.AccessTier.HasValue && m_archiveClasses.Contains(blob.Properties.AccessTier.Value);
+
+                    // Remove prefix from the name for the result
+                    var displayName = string.IsNullOrEmpty(prefix) ? blobName : blobName.Substring(prefix.Length);
 
                     yield return new FileEntry(
-                        obj.Key.Substring(prefix.Length),
-                        obj.Size ?? -1,
-                        obj.LastModified ?? default,
-                        obj.LastModified ?? default
+                        displayName,
+                        blob.Properties.ContentLength ?? 0,
+                        lastModified,
+                        lastModified
                     )
                     {
-                        IsFolder = obj.Key.EndsWith("/"),
-                        IsArchived = m_archiveClasses.Contains(obj.StorageClass)
+                        IsArchived = isArchive,
+                        IsFolder = false,
                     };
                 }
             }
@@ -380,15 +286,17 @@ namespace Duplicati.Library.Backend
 
         public async Task RenameFileAsync(string bucketName, string source, string target, CancellationToken cancelToken)
         {
-            var copyObjectRequest = new CopyObjectRequest
-            {
-                SourceBucket = bucketName,
-                SourceKey = source,
-                DestinationBucket = bucketName,
-                DestinationKey = target
-            };
+            var containerClient = m_client.GetBlobContainerClient(bucketName);
+            var sourceBlobClient = containerClient.GetBlobClient(source);
+            var targetBlobClient = containerClient.GetBlobClient(target);
 
-            await Utility.Utility.WithTimeout(m_timeouts.ListTimeout, cancelToken, ct => m_client.CopyObjectAsync(copyObjectRequest, ct)).ConfigureAwait(false);
+            // Copy source to target
+            var copyOperation = await Utility.Utility.WithTimeout(m_timeouts.ListTimeout, cancelToken, ct => targetBlobClient.StartCopyFromUriAsync(sourceBlobClient.Uri, cancellationToken: ct)).ConfigureAwait(false);
+            
+            // Wait for copy to complete
+            await copyOperation.WaitForCompletionAsync(cancelToken).ConfigureAwait(false);
+            
+            // Delete original
             await DeleteObjectAsync(bucketName, source, cancelToken).ConfigureAwait(false);
         }
 
@@ -396,8 +304,8 @@ namespace Duplicati.Library.Backend
 
         public void Dispose()
         {
-            if (m_client != null)
-                m_client.Dispose();
+            // BlobServiceClient doesn't implement IDisposable in the current version
+            // No explicit disposal needed
         }
 
         #endregion

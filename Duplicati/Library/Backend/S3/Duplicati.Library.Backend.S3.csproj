@@ -10,6 +10,8 @@
   </PropertyGroup>
 
   <ItemGroup>
+    <PackageReference Include="Azure.Storage.Blobs" Version="12.24.1" />
+    <PackageReference Include="Azure.Storage.Common" Version="12.23.0" />
     <PackageReference Include="AWSSDK.Core" Version="4.0.0.21" />
     <PackageReference Include="AWSSDK.IdentityManagement" Version="4.0.2.6" />
     <PackageReference Include="AWSSDK.S3" Version="4.0.6.4" />
